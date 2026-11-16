@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<!--
+  GoldSrc MDL Viewer v2 (HL1 / CS1.6 studiomodel, IDST v10)
+  WebGL1, no dependencies, bounds-checked parser, static reference pose
+  info panel: header / bounds / bodyparts / textures (+thumbs) / skins / bones / hitboxes / sequences / attachments
+  camera: eased orbit + inertia, smoothed zoom, pointer capture, dblclick = reset
+  [assumed: struct sizes per HL1 SDK studio.h - bone 112, bbox 32, seqdesc 176, seqgroup 104, attachment 88, bonectl 24]
+  spud ez, oil up
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>GoldSrc MDL Viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#1b1b1f;color:#ddd;font-family:Consolas,monospace;overflow:hidden}
+  #gl{display:block;width:100vw;height:100vh;touch-action:none;cursor:grab}
+  #gl.grabbing{cursor:grabbing}
+  .panel{position:absolute;top:8px;z-index:2;background:#000b;padding:10px 12px;border-radius:6px;font-size:12px}
+  #ctl{left:8px;width:270px}
+  #ctl label{display:block;margin-top:6px;font-size:11px;color:#9c9}
+  #ctl input[type=file]{display:block;margin:4px 0 8px;font-size:11px;color:#ddd;max-width:100%}
+  #err{color:#f66;font-size:11px;margin-top:6px;white-space:pre-wrap}
+  #hint{font-size:10px;color:#777;margin-top:8px}
+  #info{right:8px;width:390px;max-height:calc(100vh - 36px);overflow-y:auto;display:none;font-size:11px}
+  #info summary{cursor:pointer;color:#9c9;margin:8px 0 4px;font-size:12px}
+  #info summary:first-child{margin-top:0}
+  table{border-collapse:collapse}
+  .kv td{padding:1px 0;vertical-align:top}
+  .kv td.k{color:#8a8;padding-right:12px;white-space:nowrap}
+  .kv td.v{color:#ddd;word-break:break-all}
+  .grid{width:100%}
+  .grid th{text-align:left;color:#9c9;font-weight:normal;position:sticky;top:0;background:#111;padding:1px 8px 1px 0}
+  .grid td{padding:1px 8px 1px 0;color:#cde;white-space:nowrap}
+  .scroll{max-height:230px;overflow:auto;border:1px solid #222}
+  .thumbs{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+  .thumb{border:1px solid #333;background:#111}
+  .dim{color:#777}
+  @media (max-width:760px){
+    #ctl{right:8px;width:auto}
+    #info{left:8px;right:8px;top:auto;bottom:8px;width:auto;max-height:42vh}
+  }
+</style>
+</head>
+<body>
+<div id="ctl" class="panel">
+  <label>model .mdl (GoldSrc v10)</label>
+  <input type="file" id="fileMain" accept=".mdl">
+  <label>texture .mdl (optional, e.g. playerT.mdl)</label>
+  <input type="file" id="fileTex" accept=".mdl">
+  <div id="err"></div>
+  <div id="hint">drag = orbit · wheel = zoom · double-click = reset view</div>
+</div>
+<div id="info" class="panel"></div>
+<canvas id="gl"></canvas>
+<script>
+"use strict";
+
+/* ---------- setup ---------- */
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl", { antialias: true });
+const errEl = document.getElementById("err");
+const infoEl = document.getElementById("info");
+if (!gl) { errEl.textContent = "WebGL not available in this browser."; throw new Error("no webgl"); }
+
+/* ---------- bounds-checked binary reader ---------- */
+class Cursor {
+  constructor(buf) { this.v = new DataView(buf); this.len = buf.byteLength; }
+  chk(o, n) {
+    if (!(o >= 0 && o + n <= this.len))
+      throw new Error("corrupt or truncated MDL: read of " + n + " bytes at offset " + o + " (file is " + this.len + " bytes)");
+  }
+  i32(o) { this.chk(o, 4); return this.v.getInt32(o, true); }
+  i16(o) { this.chk(o, 2); return this.v.getInt16(o, true); }
+  f32(o) { this.chk(o, 4); return this.v.getFloat32(o, true); }
+  str(o, len) {
+    this.chk(o, len);
+    let s = "";
+    for (let i = 0; i < len; i++) {
+      const ch = this.v.getUint8(o + i);
+      if (ch === 0) break;
+      s += String.fromCharCode(ch);
+    }
+    return s;
+  }
+}
+function view(buf, off, n) {
+  if (!(off >= 0 && n >= 0 && off + n <= buf.byteLength))
+    throw new Error("corrupt MDL: block at offset " + off + " (len " + n + ") is outside the file");
+  return new Uint8Array(buf, off, n);
+}
+const MAX_COUNT = 1 << 20;
+function cnt(n, what) {
+  if (!(n >= 0 && n <= MAX_COUNT)) throw new Error("corrupt MDL: bad " + what + " count " + n);
+  return n;
+}
+
+/* ---------- math ---------- */
+function angleMatrix(roll, pitch, yaw) {
+  const sr = Math.sin(roll), cr = Math.cos(roll);
+  const sp = Math.sin(pitch), cp = Math.cos(pitch);
+  const sy = Math.sin(yaw), cy = Math.cos(yaw);
+  return [
+    [cp * cy, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy],
+    [cp * sy, sr * sp * sy + cr * cy, cr * sp * sy - sr * cy],
+    [-sp,     sr * cp,                cr * cp              ]
+  ];
+}
+function concatTransforms(a, b) {
+  const r = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++)
+      r[i][j] = a.r[i][0] * b.r[0][j] + a.r[i][1] * b.r[1][j] + a.r[i][2] * b.r[2][j];
+  const t = [0, 0, 0];
+  for (let i = 0; i < 3; i++)
+    t[i] = a.r[i][0] * b.t[0] + a.r[i][1] * b.t[1] + a.r[i][2] * b.t[2] + a.t[i];
+  return { r, t };
+}
+function xform(r, t, v) {
+  return [
+    r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2] + t[0],
+    r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2] + t[1],
+    r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2] + t[2]
+  ];
+}
+function xformNormal(r, v) {
+  return [
+    r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2],
+    r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2],
+    r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2]
+  ];
+}
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const TAU = Math.PI * 2;
+
+function mat4Perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return [f / aspect, 0, 0, 0,  0, f, 0, 0,  0, 0, (far + near) * nf, -1,  0, 0, 2 * far * near * nf, 0];
+}
+function mat4LookAt(e, c, up) {
+  const z = norm(sub(e, c));
+  const x = norm(cross(up, z));
+  const y = cross(z, x);
+  return [
+    x[0], y[0], z[0], 0,
+    x[1], y[1], z[1], 0,
+    x[2], y[2], z[2], 0,
+    -dot(x, e), -dot(y, e), -dot(z, e), 1
+  ];
+}
+function mat4Mul(a, b) {
+  const o = new Array(16);
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      o[c * 4 + r] = s;
+    }
+  return o;
+}
+
+/* ---------- studio parser (IDST v10) ---------- */
+function parseStudio(buf) {
+  if (buf.byteLength < 244) throw new Error("file too small to be a GoldSrc MDL (" + buf.byteLength + " bytes)");
+  const c = new Cursor(buf);
+  const vec = (o) => [c.f32(o), c.f32(o + 4), c.f32(o + 8)];
+
+  const h = {};
+  h.ident = c.i32(0);
+  h.version = c.i32(4);
+  if (h.ident === 0x51534449)
+    throw new Error("this is a sequence-group file (IDSQ, e.g. name01.mdl) - load the main model instead");
+  if (h.ident !== 0x54534449)
+    throw new Error("not a GoldSrc MDL (bad ident 0x" + (h.ident >>> 0).toString(16) + "). Source-engine .mdl files are not supported.");
+  if (h.version !== 10)
+    throw new Error("unsupported MDL version " + h.version + " (expected 10 / HL1)");
+
+  h.name = c.str(8, 64);
+  h.length = c.i32(72);
+  h.eye = vec(76); h.min = vec(88); h.max = vec(100); h.bbmin = vec(112); h.bbmax = vec(124);
+  h.flags = c.i32(136);
+  h.numbones = cnt(c.i32(140), "bone");                   h.boneindex = c.i32(144);
+  h.numbonecontrollers = cnt(c.i32(148), "controller");   h.bonecontrollerindex = c.i32(152);
+  h.numhitboxes = cnt(c.i32(156), "hitbox");              h.hitboxindex = c.i32(160);
+  h.numseq = cnt(c.i32(164), "sequence");                 h.seqindex = c.i32(168);
+  h.numseqgroups = cnt(c.i32(172), "sequence group");     h.seqgroupindex = c.i32(176);
+  h.numtextures = cnt(c.i32(180), "texture");             h.textureindex = c.i32(184);
+  h.numskinref = cnt(c.i32(192), "skin ref");             h.numskinfamilies = cnt(c.i32(196), "skin family");
+  h.skinindex = c.i32(200);
+  h.numbodyparts = cnt(c.i32(204), "bodypart");           h.bodypartindex = c.i32(208);
+  h.numattachments = cnt(c.i32(212), "attachment");       h.attachmentindex = c.i32(216);
+  h.numtransitions = cnt(c.i32(236), "transition");
+
+  /* bones -> reference-pose world transforms */
+  const bones = [];
+  for (let i = 0; i < h.numbones; i++) {
+    const b = h.boneindex + i * 112;
+    const parent = c.i32(b + 32);
+    if (parent < -1 || parent >= i) throw new Error("corrupt MDL: bone " + i + " has bad parent " + parent);
+    bones.push({ name: c.str(b, 32), parent, flags: c.i32(b + 36), pos: vec(b + 64), rot: vec(b + 76) });
+  }
+  const boneXf = new Array(bones.length);
+  for (let i = 0; i < bones.length; i++) {
+    const b = bones[i];
+    const local = { r: angleMatrix(b.rot[0], b.rot[1], b.rot[2]), t: b.pos };
+    boneXf[i] = b.parent === -1 ? local : concatTransforms(boneXf[b.parent], local);
+  }
+
+  const controllers = [];
+  for (let i = 0; i < h.numbonecontrollers; i++) {
+    const o = h.bonecontrollerindex + i * 24;
+    controllers.push({ bone: c.i32(o), type: c.i32(o + 4), start: c.f32(o + 8), end: c.f32(o + 12), index: c.i32(o + 20) });
+  }
+  const hitboxes = [];
+  for (let i = 0; i < h.numhitboxes; i++) {
+    const o = h.hitboxindex + i * 32;
+    hitboxes.push({ bone: c.i32(o), group: c.i32(o + 4), min: vec(o + 8), max: vec(o + 20) });
+  }
+  const seqs = [];
+  for (let i = 0; i < h.numseq; i++) {
+    const o = h.seqindex + i * 176;
+    seqs.push({
+      label: c.str(o, 32), fps: c.f32(o + 32), flags: c.i32(o + 36), activity: c.i32(o + 40),
+      numevents: c.i32(o + 48), numframes: c.i32(o + 56), numblends: c.i32(o + 120), group: c.i32(o + 156)
+    });
+  }
+  const seqgroups = [];
+  for (let i = 0; i < h.numseqgroups; i++) {
+    const o = h.seqgroupindex + i * 104;
+    seqgroups.push({ label: c.str(o, 32), name: c.str(o + 32, 64) });
+  }
+  const attachments = [];
+  for (let i = 0; i < h.numattachments; i++) {
+    const o = h.attachmentindex + i * 88;
+    attachments.push({ name: c.str(o, 32), type: c.i32(o + 32), bone: c.i32(o + 36), org: vec(o + 40) });
+  }
+
+  /* textures: 8bpp indexed + 256-entry RGB palette stored after the pixels */
+  const textures = [];
+  for (let i = 0; i < h.numtextures; i++) {
+    const t = h.textureindex + i * 80;
+    const name = c.str(t, 64);
+    const flags = c.i32(t + 64);
+    const w = c.i32(t + 68), hgt = c.i32(t + 72), idx = c.i32(t + 76);
+    if (!(w > 0 && hgt > 0 && w <= 8192 && hgt <= 8192)) throw new Error("corrupt MDL: texture " + i + " has size " + w + "x" + hgt);
+    const px = view(buf, idx, w * hgt);
+    const pal = view(buf, idx + w * hgt, 256 * 3);
+    const masked = (flags & 0x40) !== 0;   // STUDIO_NF_MASKED: index 255 is transparent
+    const rgba = new Uint8Array(w * hgt * 4);
+    for (let p = 0; p < w * hgt; p++) {
+      const pi = px[p];
+      rgba[p * 4]     = pal[pi * 3];
+      rgba[p * 4 + 1] = pal[pi * 3 + 1];
+      rgba[p * 4 + 2] = pal[pi * 3 + 2];
+      rgba[p * 4 + 3] = (masked && pi === 255) ? 0 : 255;
+    }
+    textures.push({ name, flags, w, h: hgt, rgba });
+  }
+  const skinref = [];
+  for (let i = 0; i < h.numskinref; i++) skinref.push(c.i16(h.skinindex + i * 2));
+
+  /* bodyparts -> submodels; submodel 0 of each bodypart is drawn */
+  const groups = {};   // texIdx -> flat float array [px py pz nx ny nz u v]*
+  const bounds = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+  let triCount = 0;
+
+  function buildGeometry(m) {
+    const vbone = view(buf, m.vertinfoindex, m.numverts);
+    const nbone = view(buf, m.norminfoindex, m.numnorms);
+    const verts = new Array(m.numverts);
+    for (let v = 0; v < m.numverts; v++) {
+      const vo = m.vertindex + v * 12;
+      const xf = boneXf[vbone[v]];
+      if (!xf) throw new Error("corrupt MDL: vertex " + v + " uses bone " + vbone[v]);
+      verts[v] = xform(xf.r, xf.t, [c.f32(vo), c.f32(vo + 4), c.f32(vo + 8)]);
+      for (let k = 0; k < 3; k++) {
+        bounds.min[k] = Math.min(bounds.min[k], verts[v][k]);
+        bounds.max[k] = Math.max(bounds.max[k], verts[v][k]);
+      }
+    }
+    const norms = new Array(m.numnorms);
+    for (let n = 0; n < m.numnorms; n++) {
+      const no = m.normindex + n * 12;
+      const xf = boneXf[nbone[n]];
+      if (!xf) throw new Error("corrupt MDL: normal " + n + " uses bone " + nbone[n]);
+      norms[n] = norm(xformNormal(xf.r, [c.f32(no), c.f32(no + 4), c.f32(no + 8)]));
+    }
+    for (let me = 0; me < m.nummesh; me++) {
+      const ms = m.meshindex + me * 20;
+      const mskin = c.i32(ms + 8);
+      const texIdx = skinref.length ? skinref[mskin] : mskin;
+      const tex = textures[texIdx];
+      const tw = tex ? tex.w : 1, th = tex ? tex.h : 1;
+      const out = groups[texIdx] || (groups[texIdx] = []);
+      let p = c.i32(ms + 4);
+      for (;;) {
+        const count = c.i16(p); p += 2;
+        if (count === 0) break;
+        const n = Math.abs(count), fan = count < 0;   // + = strip, - = fan
+        const vs = [];
+        for (let k = 0; k < n; k++) {
+          vs.push({ vi: c.i16(p), ni: c.i16(p + 2), s: c.i16(p + 4), t: c.i16(p + 6) });
+          p += 8;
+        }
+        for (let k = 2; k < n; k++) {
+          const tri = fan ? [vs[0], vs[k - 1], vs[k]] : [vs[k - 2], vs[k - 1], vs[k]];
+          for (const q of tri) {
+            const P = verts[q.vi];
+            if (!P) throw new Error("corrupt MDL: triangle uses vertex " + q.vi + " (model has " + m.numverts + ")");
+            const N = norms[q.ni] || [0, 0, 1];
+            out.push(P[0], P[1], P[2], N[0], N[1], N[2], q.s / tw, q.t / th);
+          }
+          triCount++;
+        }
+      }
+    }
+  }
+
+  const bodyparts = [];
+  for (let i = 0; i < h.numbodyparts; i++) {
+    const bp = h.bodypartindex + i * 76;
+    const nummodels = cnt(c.i32(bp + 64), "submodel");
+    const modelindex = c.i32(bp + 72);
+    const part = { name: c.str(bp, 64), models: [] };
+    for (let k = 0; k < nummodels; k++) {
+      const mo = modelindex + k * 112;
+      const m = {
+        name: c.str(mo, 64),
+        nummesh: cnt(c.i32(mo + 72), "mesh"), meshindex: c.i32(mo + 76),
+        numverts: cnt(c.i32(mo + 80), "vertex"), vertinfoindex: c.i32(mo + 84), vertindex: c.i32(mo + 88),
+        numnorms: cnt(c.i32(mo + 92), "normal"), norminfoindex: c.i32(mo + 96), normindex: c.i32(mo + 100),
+        tris: 0, shown: k === 0
+      };
+      for (let me = 0; me < m.nummesh; me++) {            // triangle count without building geometry
+        let p = c.i32(m.meshindex + me * 20 + 4);
+        for (;;) {
+          const n = c.i16(p); p += 2;
+          if (n === 0) break;
+          const kk = Math.abs(n);
+          p += 8 * kk;
+          m.tris += Math.max(0, kk - 2);
+        }
+      }
+      part.models.push(m);
+    }
+    bodyparts.push(part);
+    if (part.models.length) buildGeometry(part.models[0]);
+  }
+
+  return { h, bones, controllers, hitboxes, seqs, seqgroups, attachments, textures, skinref,
+           groups, bounds, bodyparts, triCount, fileSize: buf.byteLength };
+}
+
+/* ---------- GL helpers ---------- */
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("shader: " + gl.getShaderInfoLog(s));
+  return s;
+}
+const program = (() => {
+  const vs = `
+    attribute vec3 aPos; attribute vec3 aNrm; attribute vec2 aUv;
+    uniform mat4 uMVP;
+    varying vec3 vN; varying vec2 vUv;
+    void main(){ gl_Position = uMVP * vec4(aPos,1.0); vN = aNrm; vUv = aUv; }`;
+  const fs = `
+    precision mediump float;
+    varying vec3 vN; varying vec2 vUv;
+    uniform sampler2D uTex; uniform vec3 uLight;
+    void main(){
+      vec4 c = texture2D(uTex, vUv);
+      if (c.a < 0.5) discard;
+      float d = max(dot(normalize(vN), normalize(uLight)), 0.0);
+      gl_FragColor = vec4(c.rgb * (0.35 + 0.65 * d), 1.0);
+    }`;
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link: " + gl.getProgramInfoLog(p));
+  return p;
+})();
+const loc = {
+  pos: gl.getAttribLocation(program, "aPos"),
+  nrm: gl.getAttribLocation(program, "aNrm"),
+  uv:  gl.getAttribLocation(program, "aUv"),
+  mvp: gl.getUniformLocation(program, "uMVP"),
+  tex: gl.getUniformLocation(program, "uTex"),
+  light: gl.getUniformLocation(program, "uLight")
+};
+
+/* ---------- scene ---------- */
+let scene = null;       // { drawList: [{tex, buf, count}], center, radius }
+let glTextures = [];
+let fallbackTex = null;
+
+const isPOT = (n) => (n & (n - 1)) === 0;
+function makeTexture(rgba, w, h) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  if (isPOT(w) && isPOT(h)) {                      // mipmaps stop texture shimmer while orbiting
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  } else {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
+  return t;
+}
+function disposeScene() {
+  if (!scene) return;
+  for (const d of scene.drawList) gl.deleteBuffer(d.buf);
+  for (const t of glTextures) gl.deleteTexture(t);
+  if (fallbackTex) gl.deleteTexture(fallbackTex);
+  scene = null; glTextures = []; fallbackTex = null;
+}
+function buildScene(parsed, extTextures) {
+  disposeScene();
+  const texSrc = parsed.textures.length ? parsed.textures : (extTextures || []);
+  glTextures = texSrc.map(t => makeTexture(t.rgba, t.w, t.h));
+  fallbackTex = makeTexture(new Uint8Array([200, 200, 200, 255]), 1, 1);
+
+  const drawList = [];
+  for (const key of Object.keys(parsed.groups)) {
+    const data = new Float32Array(parsed.groups[key]);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    drawList.push({ tex: glTextures[+key] || fallbackTex, buf, count: data.length / 8 });
+  }
+  const b = parsed.bounds;
+  if (!isFinite(b.min[0])) { scene = { drawList, center: [0, 0, 0], radius: 1 }; resetCam(true); return; }
+  const center = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2];
+  const radius = Math.max(1e-3, Math.hypot(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]) / 2);
+  scene = { drawList, center, radius };
+  resetCam(true);
+}
+
+/* ---------- camera: eased orbit + inertia ---------- */
+const PITCH_MAX = 1.5, VMAX = 12;
+const cam = { yaw: 0.6, pitch: 0.2, dist: 100, tYaw: 0.6, tPitch: 0.2, tDist: 100, vYaw: 0, vPitch: 0 };
+let viewShift = 0;   // NDC x offset so the model centers in the area the info panel leaves free
+function resetCam(snap) {
+  const d = scene ? scene.radius * 2.6 : 100;
+  cam.vYaw = cam.vPitch = 0;
+  if (snap) { cam.yaw = cam.tYaw = 0.6; cam.pitch = cam.tPitch = 0.2; cam.dist = cam.tDist = d; return; }
+  const diff = ((0.6 - cam.yaw + Math.PI) % TAU + TAU) % TAU - Math.PI;   // shortest way back
+  cam.tYaw = cam.yaw + diff; cam.tPitch = 0.2; cam.tDist = d;
+}
+function updateCamera(dt) {
+  if (!drag.active) {                                 // inertia after release
+    cam.tYaw += cam.vYaw * dt;
+    cam.tPitch = clamp(cam.tPitch + cam.vPitch * dt, -PITCH_MAX, PITCH_MAX);
+    const decay = Math.exp(-dt * 3.5);
+    cam.vYaw *= decay; cam.vPitch *= decay;
+    if (Math.abs(cam.vYaw) < 1e-3) cam.vYaw = 0;
+    if (Math.abs(cam.vPitch) < 1e-3) cam.vPitch = 0;
+  }
+  const k = 1 - Math.exp(-dt * 22);                   // frame-rate independent easing
+  cam.yaw += (cam.tYaw - cam.yaw) * k;
+  cam.pitch += (cam.tPitch - cam.pitch) * k;
+  cam.dist += (cam.tDist - cam.dist) * (1 - Math.exp(-dt * 14));
+  const wantShift = (infoEl.style.display === "block" && window.innerWidth > 760)
+    ? -(infoEl.offsetWidth + 8) / window.innerWidth : 0;
+  viewShift += (wantShift - viewShift) * k;
+}
+
+/* ---------- input ---------- */
+const drag = { active: false, id: -1, x: 0, y: 0, t: 0 };
+canvas.addEventListener("pointerdown", e => {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  drag.active = true; drag.id = e.pointerId; drag.x = e.clientX; drag.y = e.clientY; drag.t = e.timeStamp;
+  cam.vYaw = cam.vPitch = 0;
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add("grabbing");
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drag.active || e.pointerId !== drag.id) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  const dtm = Math.max(0.001, (e.timeStamp - drag.t) / 1000);
+  drag.x = e.clientX; drag.y = e.clientY; drag.t = e.timeStamp;
+  const sens = Math.PI * 1.2 / Math.max(300, canvas.clientHeight);
+  const dYaw = -dx * sens, dPitch = dy * sens;
+  cam.tYaw += dYaw;
+  cam.tPitch = clamp(cam.tPitch + dPitch, -PITCH_MAX, PITCH_MAX);
+  cam.vYaw = clamp(cam.vYaw * 0.5 + (dYaw / dtm) * 0.5, -VMAX, VMAX);
+  cam.vPitch = clamp(cam.vPitch * 0.5 + (dPitch / dtm) * 0.5, -VMAX, VMAX);
+});
+function endDrag(e) {
+  if (!drag.active || e.pointerId !== drag.id) return;
+  drag.active = false;
+  canvas.classList.remove("grabbing");
+  if (e.timeStamp - drag.t > 80) cam.vYaw = cam.vPitch = 0;   // held still before release: no fling
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  let dy = e.deltaY;
+  if (e.deltaMode === 1) dy *= 16; else if (e.deltaMode === 2) dy *= 400;
+  const r = scene ? scene.radius : 50;
+  cam.tDist = clamp(cam.tDist * Math.exp(dy * 0.0015), r * 0.2, r * 30);
+}, { passive: false });
+canvas.addEventListener("dblclick", () => resetCam(false));
+
+/* ---------- render loop ---------- */
+let cw = 0, ch = 0, lastT = performance.now();
+function fitCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (w !== cw || h !== ch) { canvas.width = cw = w; canvas.height = ch = h; }   // only on real size change
+  gl.viewport(0, 0, cw, ch);
+}
+function render(now) {
+  const dt = Math.min(0.1, Math.max(0.001, (now - lastT) / 1000));
+  lastT = now;
+  fitCanvas();
+  updateCamera(dt);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.11, 0.11, 0.12, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  if (scene) {
+    // GoldSrc is Z-up: orbit around the model center
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    const eye = [
+      scene.center[0] + cam.dist * cp * Math.cos(cam.yaw),
+      scene.center[1] + cam.dist * cp * Math.sin(cam.yaw),
+      scene.center[2] + cam.dist * sp
+    ];
+    const near = Math.max(scene.radius * 0.02, 0.05), far = cam.dist + scene.radius * 20;
+    const proj = mat4Perspective(Math.PI / 4, cw / ch, near, far);
+    proj[8] = -viewShift;                            // slide the scene sideways in clip space
+    const mvp = mat4Mul(proj, mat4LookAt(eye, scene.center, [0, 0, 1]));
+
+    gl.useProgram(program);
+    gl.uniformMatrix4fv(loc.mvp, false, mvp);
+    gl.uniform3f(loc.light, 0.4, 0.3, 0.9);
+    gl.uniform1i(loc.tex, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    const stride = 8 * 4;
+    for (const d of scene.drawList) {
+      gl.bindTexture(gl.TEXTURE_2D, d.tex);
+      gl.bindBuffer(gl.ARRAY_BUFFER, d.buf);
+      gl.enableVertexAttribArray(loc.pos);
+      gl.enableVertexAttribArray(loc.nrm);
+      gl.enableVertexAttribArray(loc.uv);
+      gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, stride, 0);
+      gl.vertexAttribPointer(loc.nrm, 3, gl.FLOAT, false, stride, 12);
+      gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, stride, 24);
+      gl.drawArrays(gl.TRIANGLES, 0, d.count);
+    }
+  }
+  requestAnimationFrame(render);
+}
+
+/* ---------- info panel (DOM-built, no innerHTML) ---------- */
+const TEX_FLAGS = [[0x01, "flatshade"], [0x02, "chrome"], [0x04, "fullbright"], [0x08, "nomips"],
+                   [0x10, "alpha"], [0x20, "additive"], [0x40, "masked"]];
+const texFlags = f => TEX_FLAGS.filter(([b]) => f & b).map(([, n]) => n).join(" ") || "-";
+const f2 = n => (Math.round(n * 100) / 100).toString();
+const v3 = v => v.map(f2).join(", ");
+const kb = n => (n / 1024).toFixed(1) + " KB";
+const safe = s => s.replace(/[^\x20-\x7e]/g, "?");
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = String(text);
+  return e;
+}
+function section(title, open) {
+  const d = el("details");
+  d.open = !!open;
+  d.appendChild(el("summary", null, title));
+  infoEl.appendChild(d);
+  return d;
+}
+function kv(parent, rows) {
+  const t = el("table", "kv");
+  for (const [k, v] of rows) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "k", k));
+    tr.appendChild(el("td", "v", v));
+    t.appendChild(tr);
+  }
+  parent.appendChild(t);
+}
+function grid(parent, heads, rows, scroll) {
+  const wrap = el("div", scroll ? "scroll" : "");
+  const t = el("table", "grid");
+  const hr = el("tr");
+  for (const hd of heads) hr.appendChild(el("th", null, hd));
+  const thead = el("thead"); thead.appendChild(hr); t.appendChild(thead);
+  const tb = el("tbody");
+  for (const r of rows) {
+    const row = el("tr");
+    for (const cell of r) row.appendChild(el("td", null, cell));
+    tb.appendChild(row);
+  }
+  t.appendChild(tb); wrap.appendChild(t); parent.appendChild(wrap);
+}
+function thumb(t) {
+  const full = document.createElement("canvas");
+  full.width = t.w; full.height = t.h;
+  full.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(t.rgba), t.w, t.h), 0, 0);
+  const sc = Math.min(1, 96 / Math.max(t.w, t.h));
+  const cv = el("canvas", "thumb");
+  cv.width = Math.max(1, Math.round(t.w * sc)); cv.height = Math.max(1, Math.round(t.h * sc));
+  cv.getContext("2d").drawImage(full, 0, 0, cv.width, cv.height);
+  cv.title = t.name + " (" + t.w + "x" + t.h + ")";
+  return cv;
+}
+
+function showInfo(p, ext, fileName) {
+  infoEl.replaceChildren();
+  const h = p.h, b = p.bounds, hasGeo = isFinite(b.min[0]);
+  const texList = p.textures.length ? p.textures : (ext || []);
+  const texNote = p.textures.length ? "embedded" : (ext ? "from companion file" : "none - load the *T.mdl");
+  const boneName = i => (i >= 0 && i < p.bones.length) ? p.bones[i].name : "-";
+
+  let s = section("General", true);
+  kv(s, [
+    ["file", fileName],
+    ["internal name", safe(h.name.split(/[\\/]/).pop())],
+    ["format", "IDST v" + h.version + " (GoldSrc / HL1)"],
+    ["file size", kb(p.fileSize) + (h.length !== p.fileSize ? "  (header says " + h.length + " B)" : "")],
+    ["flags", "0x" + (h.flags >>> 0).toString(16)],
+    ["bones", h.numbones],
+    ["bone controllers", h.numbonecontrollers],
+    ["hitboxes", h.numhitboxes],
+    ["sequences", h.numseq + "  (" + h.numseqgroups + " group" + (h.numseqgroups === 1 ? "" : "s") + ")"],
+    ["attachments", h.numattachments],
+    ["transitions", h.numtransitions],
+    ["bodyparts", h.numbodyparts],
+    ["triangles drawn", p.triCount]
+  ]);
+
+  s = section("Bounds (GoldSrc units)", true);
+  const size = hasGeo ? [b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]] : null;
+  kv(s, [
+    ["mesh min", hasGeo ? v3(b.min) : "-"],
+    ["mesh max", hasGeo ? v3(b.max) : "-"],
+    ["mesh size", size ? v3(size) + "  (x, y, z)" : "-"],
+    ["hull min/max", v3(h.min) + "  /  " + v3(h.max)],
+    ["clip bbmin/bbmax", v3(h.bbmin) + "  /  " + v3(h.bbmax)],
+    ["eye position", v3(h.eye)]
+  ]);
+
+  s = section("Bodyparts / submodels", true);
+  const bpRows = [];
+  p.bodyparts.forEach(bp => bp.models.forEach((m, i) =>
+    bpRows.push([i === 0 ? bp.name : "", i, safe(m.name) || "-", m.nummesh, m.numverts, m.numnorms, m.tris, m.shown ? "yes" : ""])));
+  if (bpRows.length) grid(s, ["part", "#", "model", "mesh", "verts", "norms", "tris", "shown"], bpRows, true);
+  else s.appendChild(el("div", "dim", "none"));
+
+  s = section("Textures (" + texList.length + ", " + texNote + ")", true);
+  if (texList.length) {
+    grid(s, ["#", "name", "size", "flags"], texList.map((t, i) => [i, safe(t.name), t.w + "x" + t.h, texFlags(t.flags)]), true);
+    const row = el("div", "thumbs");
+    for (const t of texList) { try { row.appendChild(thumb(t)); } catch (e) { /* thumbnail is cosmetic */ } }
+    s.appendChild(row);
+  }
+  kv(s, [
+    ["skin refs", p.skinref.length ? p.skinref.join(", ") : "-"],
+    ["skin families", h.numskinfamilies]
+  ]);
+
+  s = section("Sequences (" + p.seqs.length + ")", true);
+  if (p.seqs.length)
+    grid(s, ["#", "name", "frames", "fps", "sec", "loop", "act", "ev", "blend", "grp"],
+      p.seqs.map((q, i) => [i, safe(q.label), q.numframes, f2(q.fps), q.fps > 0 ? f2(q.numframes / q.fps) : "-",
+        (q.flags & 1) ? "yes" : "", q.activity, q.numevents, q.numblends, q.group]), true);
+  else s.appendChild(el("div", "dim", "none"));
+  if (p.seqgroups.length)
+    kv(s, p.seqgroups.map((g, i) => ["seq group " + i, safe(g.label) + (g.name ? "  " + safe(g.name) : "")]));
+
+  s = section("Bones (" + p.bones.length + ")", false);
+  grid(s, ["#", "name", "parent", "pos", "rot (rad)"],
+    p.bones.map((bn, i) => [i, safe(bn.name), bn.parent < 0 ? "-" : bn.parent + " " + safe(boneName(bn.parent)), v3(bn.pos), v3(bn.rot)]), true);
+
+  if (p.hitboxes.length) {
+    s = section("Hitboxes (" + p.hitboxes.length + ")", false);
+    grid(s, ["#", "bone", "group", "min", "max"],
+      p.hitboxes.map((x, i) => [i, safe(boneName(x.bone)), x.group, v3(x.min), v3(x.max)]), true);
+  }
+  if (p.controllers.length) {
+    s = section("Bone controllers (" + p.controllers.length + ")", false);
+    grid(s, ["#", "bone", "type", "start", "end", "index"],
+      p.controllers.map((x, i) => [i, safe(boneName(x.bone)), x.type, f2(x.start), f2(x.end), x.index]), true);
+  }
+  if (p.attachments.length) {
+    s = section("Attachments (" + p.attachments.length + ")", false);
+    grid(s, ["#", "name", "bone", "origin"],
+      p.attachments.map((x, i) => [i, safe(x.name) || "-", safe(boneName(x.bone)), v3(x.org)]), true);
+  }
+  infoEl.style.display = "block";
+}
+
+/* ---------- file loading ---------- */
+let loadToken = 0;
+async function loadFiles() {
+  const token = ++loadToken;
+  errEl.textContent = "";
+  const mainFile = document.getElementById("fileMain").files[0];
+  const texFile = document.getElementById("fileTex").files[0];
+  if (!mainFile) return;
+  try {
+    const parsed = parseStudio(await mainFile.arrayBuffer());
+    let ext = null;
+    if (texFile) {
+      try { ext = parseStudio(await texFile.arrayBuffer()).textures; }
+      catch (e) { throw new Error("texture file: " + e.message); }
+    }
+    if (token !== loadToken) return;                 // a newer selection superseded this one
+    if (!parsed.textures.length && !(ext && ext.length))
+      errEl.textContent = "no textures in this file - load the matching *T.mdl as the second file";
+    buildScene(parsed, ext);
+    showInfo(parsed, ext, mainFile.name);
+  } catch (err) {
+    if (token !== loadToken) return;
+    disposeScene();
+    infoEl.style.display = "none";
+    errEl.textContent = String(err && err.message ? err.message : err);
+  }
+}
+document.getElementById("fileMain").addEventListener("change", loadFiles);
+document.getElementById("fileTex").addEventListener("change", loadFiles);
+
+requestAnimationFrame(render);
+/* bench: Chromium/Firefox WebGL1; needs a GPU or SwiftShader; t-rex.mdl (58 bones, 512x512 tex, 2680 tris) parses with no OOB reads */
+</script>
+</body>
+</html>
